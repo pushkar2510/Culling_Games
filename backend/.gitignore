@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.env
+
+# Flask
+instance/
+.webassets-cache
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# migrations cache
+migrations/__pycache__/
+
+# node (frontend)
+node_modules/
+dist/
+build/
+
+# cloudinary temp
+*.tmp
+
+
+# environment configs
+.env.*
+!.env.example
+
+# secrets
+secrets.json
+
+# pytest
+.pytest_cache/
+
+# coverage
+.coverage
+htmlcov/
+
+# gunicorn runtime
+gunicorn.conf.py
+
+# uploads (if local fallback exists)
+uploads/
+
+# macOS
+.AppleDouble
+.LSOverride
+
+
