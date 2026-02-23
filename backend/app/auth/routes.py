@@ -1,135 +1,133 @@
-from app.services.coordinator_assignment_service import rebalance_all_teams
-from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
-from app.middleware.role_required import role_required
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import create_access_token
-from datetime import datetime, timedelta
-from app.models import ActiveSession
-from .utils import verify_password
-from app.extensions import db
-from app.models import User
-from .utils import hash_password
-from app.models import GameState
+"""
+auth/routes.py  —  Firebase-backed authentication endpoints
 
+Auth flow:
+  TEAM self-register:
+    POST /api/auth/register  → backend creates Firebase Auth user + Firestore doc
+    Frontend then calls signInWithEmailAndPassword to get the ID token
+  Login:
+    Done entirely on the frontend via Firebase JS SDK (signInWithEmailAndPassword)
+    Every subsequent request carries  Authorization: Bearer <Firebase ID token>
+  Logout:
+    Frontend calls Firebase signOut() — no backend call needed
+    /api/auth/logout kept as a stub for compatibility
+  Create MASTER / COORDINATOR:
+    POST /api/auth/create-admin  (MASTER only) → backend-controlled creation
+"""
+
+from flask import Blueprint, request, jsonify, g
+from datetime import datetime
+from app.firebase_app import get_db
+from app.middleware.role_required import role_required, get_current_uid
+from firebase_admin import auth as firebase_auth
+from app.services.coordinator_assignment_service import rebalance_all_teams
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
+SUPER_ADMIN_EMAIL = "gamesburner10@gmail.com"
+
+
+# ─── helpers ────────────────────────────────────────────────────────────────
+
+def _create_firebase_user(name, email, password, role):
+    """
+    Create a user in Firebase Auth, set custom role claim, and
+    persist the profile to Firestore  users/{uid}.
+    Returns the Firebase UID.
+    """
+    db = get_db()
+
+    user_record = firebase_auth.create_user(
+        email=email,
+        password=password,
+        display_name=name,
+    )
+    uid = user_record.uid
+
+    # Custom claim so ID tokens carry the role without a Firestore round-trip
+    firebase_auth.set_custom_user_claims(uid, {"role": role})
+
+    db.collection("users").document(uid).set({
+        "uid": uid,
+        "name": name,
+        "email": email,
+        "role": role,
+        "is_active": True,
+        "created_at": datetime.utcnow().isoformat(),
+    })
+
+    return uid
+
+
+# ─── public endpoints ────────────────────────────────────────────────────────
 
 @auth_bp.route("/register", methods=["POST"])
 def register():
-    state = GameState.query.first()
+    """
+    TEAM self-registration — backend owns user creation.
+    Frontend sends: { name, email, password }
+    ( The 'role' field is accepted but ignored; always set to TEAM )
+    """
+    db = get_db()
 
-    if state and not state.registration_open:
-        return jsonify({
-            "error": "Registration is closed"
-        }), 403
+    state_snap = db.collection("game_state").document("current").get()
+    if state_snap.exists:
+        state = state_snap.to_dict()
+        if not state.get("registration_open", True):
+            return jsonify({"error": "Registration is closed"}), 403
 
     data = request.get_json()
-
     name = data.get("name")
     email = data.get("email")
     password = data.get("password")
-    role = data.get("role")
 
-    if not all([name, email, password, role]):
-        return jsonify({"error": "All fields are required"}), 400
+    if not all([name, email, password]):
+        return jsonify({"error": "name, email, and password are required"}), 400
 
-    if role != "TEAM":
-        return jsonify({"error": "Only TEAM registration allowed"}), 403
-
-
-    existing_user = User.query.filter_by(email=email).first()
-    if existing_user:
+    existing = db.collection("users").where("email", "==", email).limit(1).get()
+    if existing:
         return jsonify({"error": "Email already registered"}), 400
 
-    hashed_password = hash_password(password)
+    try:
+        _create_firebase_user(name, email, password, "TEAM")
+    except firebase_auth.EmailAlreadyExistsError:
+        return jsonify({"error": "Email already registered"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Registration failed: {str(e)}"}), 500
 
-    new_user = User(
-        name=name,
-        email=email,
-        password_hash=hashed_password,
-        role=role
-    )
-
-    db.session.add(new_user)
-    db.session.commit()
-
-    return jsonify({"message": "User registered successfully"}), 201
+    return jsonify({"message": "User registered successfully. Please sign in."}), 201
 
 
 @auth_bp.route("/login", methods=["POST"])
 def login():
-    data = request.get_json()
-
-    email = data.get("email")
-    password = data.get("password")
-
-    if not email or not password:
-        return jsonify({"error": "Email and password required"}), 400
-
-    user = User.query.filter_by(email=email).first()
-
-    if not user or not verify_password(password, user.password_hash):
-        return jsonify({"error": "Invalid credentials"}), 401
-
-    # Generate JWT token
-    access_token = create_access_token(
-        identity=str(user.id),
-        additional_claims={"role": user.role}
-    )
-
-    # Extract JTI safely
-    from flask_jwt_extended import decode_token
-    decoded = decode_token(access_token)
-    jti = decoded["jti"]
-
-    # Delete ONLY this user's old sessions
-    ActiveSession.query.filter(
-        ActiveSession.user_id == user.id
-    ).delete()
-
-    # Create new session with 2-hour expiry (ONLY CHANGE)
-    new_session = ActiveSession(
-        user_id=user.id,
-        jwt_id=jti,
-        expires_at=datetime.utcnow() + timedelta(hours=2)
-    )
-
-    db.session.add(new_session)
-    db.session.commit()
-
+    """
+    Stub for backward compatibility.
+    Real login is handled client-side via Firebase signInWithEmailAndPassword.
+    The resulting ID token must be passed as  Authorization: Bearer <token>.
+    """
     return jsonify({
-        "access_token": access_token,
-        "user_id": user.id,
-        "role": user.role
+        "message": (
+            "Login is handled client-side via Firebase Auth. "
+            "Call Firebase signInWithEmailAndPassword, then pass "
+            "the ID token as Authorization: Bearer <token>."
+        )
     }), 200
 
 
-@auth_bp.route("/protected", methods=["GET"])
-@jwt_required()
-def protected():
-    current_user_id = get_jwt_identity()
-    return jsonify({
-        "message": "Protected route accessed",
-        "user_id": current_user_id
-    }), 200
+@auth_bp.route("/logout", methods=["POST"])
+def logout():
+    """
+    Stateless stub — real logout is Firebase signOut() on the frontend.
+    """
+    return jsonify({"message": "Logged out successfully"}), 200
 
 
-@auth_bp.route("/master-only", methods=["GET"])
-@role_required("MASTER")
-def master_only():
-    return jsonify({"message": "Welcome Master"}), 200
-
-
-@auth_bp.route("/team-only", methods=["GET"])
-@role_required("TEAM")
-def team_only():
-    return jsonify({"message": "Welcome Team"}), 200
-
+# ─── protected endpoints ──────────────────────────────────────────────────────
 
 @auth_bp.route("/create-admin", methods=["POST"])
 @role_required("MASTER")
 def create_admin():
+    """MASTER creates a COORDINATOR or another MASTER account."""
     data = request.get_json()
 
     name = data.get("name")
@@ -143,42 +141,40 @@ def create_admin():
     if role not in ["MASTER", "COORDINATOR"]:
         return jsonify({"error": "Invalid role for admin creation"}), 400
 
-    existing = User.query.filter_by(email=email).first()
+    db = get_db()
+    existing = db.collection("users").where("email", "==", email).limit(1).get()
     if existing:
         return jsonify({"error": "Email already exists"}), 400
 
-    new_user = User(
-        name=name,
-        email=email,
-        password_hash=hash_password(password),
-        role=role
-    )
+    try:
+        _create_firebase_user(name, email, password, role)
+    except firebase_auth.EmailAlreadyExistsError:
+        return jsonify({"error": "Email already exists"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Creation failed: {str(e)}"}), 500
 
-    db.session.add(new_user)
-    db.session.commit()
-
-    # Rebalance teams if coordinator added
     if role == "COORDINATOR":
         rebalance_all_teams()
 
+    return jsonify({"message": f"{role} created successfully"}), 201
+
+
+@auth_bp.route("/protected", methods=["GET"])
+@role_required("MASTER", "COORDINATOR", "TEAM")
+def protected():
     return jsonify({
-        "message": f"{role} created successfully"
-    }), 201
-
-
-@auth_bp.route("/logout", methods=["POST"])
-@jwt_required()
-def logout():
-
-    jwt_data = get_jwt()
-    jti = jwt_data["jti"]
-
-    session = ActiveSession.query.filter_by(jwt_id=jti).first()
-
-    if session:
-        db.session.delete(session)
-        db.session.commit()
-
-    return jsonify({
-        "message": "Logged out successfully"
+        "message": "Protected route accessed",
+        "uid": get_current_uid()
     }), 200
+
+
+@auth_bp.route("/master-only", methods=["GET"])
+@role_required("MASTER")
+def master_only():
+    return jsonify({"message": "Welcome Master"}), 200
+
+
+@auth_bp.route("/team-only", methods=["GET"])
+@role_required("TEAM")
+def team_only():
+    return jsonify({"message": "Welcome Team"}), 200

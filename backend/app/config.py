@@ -1,18 +1,21 @@
 import os
-from datetime import timedelta
+
 
 class Config:
 
-    SECRET_KEY = os.getenv("SECRET_KEY")
+    SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
 
-    SQLALCHEMY_DATABASE_URI = os.getenv("DATABASE_URL")
+    # Firebase — path to the downloaded service account JSON
+    FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH")
 
-    SQLALCHEMY_TRACK_MODIFICATIONS = False
-
-    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-
-    JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=2)
-
+    # Cloudinary (unchanged)
     CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
     CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
     CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
+
+    # Mail (unchanged)
+    MAIL_SERVER = os.getenv("MAIL_SERVER", "smtp.gmail.com")
+    MAIL_PORT = int(os.getenv("MAIL_PORT", 587))
+    MAIL_USE_TLS = True
+    MAIL_USERNAME = os.getenv("MAIL_USERNAME")
+    MAIL_PASSWORD = os.getenv("MAIL_PASSWORD")

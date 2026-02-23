@@ -1,14 +1,3 @@
-from .user_model import User
-from .active_session_model import ActiveSession
-from .team_model import Team
-from .team_member_model import TeamMember
-from .task_model import Task
-from .submission_model import Submission
-from .point_adjustment_model import PointAdjustment
-from .notification_model import Notification
-from .team_power_model import TeamPower
-from .week_config_model import WeekConfig
-from .game_state_model import GameState
-from .power_usage_log_model import PowerUsageLog
-from .query_model import Query
-from .curse_attack_model import CurseAttack
+# Models replaced by Firestore.
+# All data access is done via firebase_app.get_db() directly in route files.
+# SQLAlchemy ORM models are no longer used.

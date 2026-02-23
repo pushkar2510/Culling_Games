@@ -1,10 +1,7 @@
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import get_jwt_identity
+from flask import Blueprint, request, jsonify, g
+from firebase_admin import firestore as firestore_sdk
+from app.firebase_app import get_db
 from app.middleware.role_required import role_required
-from app.models import Team, TeamPower, Submission, Task
-from app.extensions import db
-from app.models import GameState
-from app.models import PowerUsageLog
 
 
 powers_bp = Blueprint(
@@ -14,304 +11,288 @@ powers_bp = Blueprint(
 )
 
 
-# 🔹 TEAM — Request Curse or Shield
+def _get_game_state(db):
+    doc = db.collection("game_state").document("current").get()
+    return doc.to_dict() if doc.exists else None
+
+
+# TEAM - Request Curse or Shield
 @powers_bp.route("/request", methods=["POST"])
 @role_required("TEAM")
 def request_power():
-    user_id = int(get_jwt_identity())
-    state = GameState.query.first()
+    uid = g.uid
+    db = get_db()
 
-    if not state or not state.is_active:
+    state = _get_game_state(db)
+    if not state or not state.get("is_active"):
         return jsonify({"error": "Game not active"}), 403
-
-    if state.is_paused:
+    if state.get("is_paused"):
         return jsonify({"error": "Game is paused"}), 403
 
     data = request.get_json()
-    power_type = data.get("power_type")  # CURSE or SHIELD
-
+    power_type = data.get("power_type")
     if power_type not in ["CURSE", "SHIELD"]:
         return jsonify({"error": "Invalid power type"}), 400
 
-    team = Team.query.filter_by(leader_id=user_id).first()
-    if not team:
+    teams = db.collection("teams").where("leader_uid", "==", uid).limit(1).stream()
+    team_doc = next(teams, None)
+    if not team_doc:
         return jsonify({"error": "Team not found"}), 404
 
-    if team.is_disqualified:
+    team = team_doc.to_dict()
+    team_id = team_doc.id
+
+    if team.get("is_disqualified"):
         return jsonify({"error": "Disqualified team cannot request powers"}), 403
 
-    # 🔥 FIX 1: STRICT WEEKLY LIMIT
-    existing_power = TeamPower.query.filter_by(
-        team_id=team.id,
-        week_number=team.week_number
-    ).first()
-
-    if existing_power:
+    existing = (
+        db.collection("team_powers")
+        .where("team_id", "==", team_id)
+        .where("week_number", "==", team.get("week_number"))
+        .limit(1)
+        .stream()
+    )
+    if next(existing, None):
         return jsonify({"error": "You have already requested or used a power this week."}), 400
 
-    # 🔥 FIX 2: TOP 10 CHECK
-    top_teams = (
-        db.session.query(Team)
-        .filter(Team.is_disqualified == False)
-        .order_by(Team.total_points.desc())
+    top_teams_stream = (
+        db.collection("teams")
+        .where("is_disqualified", "==", False)
+        .order_by("total_points", direction=firestore_sdk.Query.DESCENDING)
         .limit(10)
-        .all()
+        .stream()
     )
-    
-    top_team_ids = [int(t.id) for t in top_teams]
-    eligible = int(team.id) in top_team_ids
+    top_team_ids = {t.id for t in top_teams_stream}
+    eligible = team_id in top_team_ids
 
-    # 🔥 FIX 3: BULLETPROOF BONUS TASK CHECK (Checks active AND archived tasks)
     if not eligible:
-        all_tasks = Task.query.all()
+        all_tasks = db.collection("tasks").stream()
         bonus_task_ids = []
         for t in all_tasks:
-            is_bonus_flag = getattr(t, 'is_bonus', False)
-            category = getattr(t, 'category', '')
-            name = getattr(t, 'name', '')
-            
-            # Check boolean, category, or if the word 'bonus' is anywhere in the name
-            if is_bonus_flag or (category and str(category).upper() == "BONUS") or ("bonus" in str(name).lower()):
+            td = t.to_dict()
+            is_bonus = td.get("is_bonus", False)
+            category = str(td.get("category", "")).upper()
+            name = str(td.get("name", "")).lower()
+            if is_bonus or category == "BONUS" or "bonus" in name:
                 bonus_task_ids.append(t.id)
 
         if bonus_task_ids:
-            # Check if they have an APPROVED submission for any of those tasks
-            approved_bonus = Submission.query.filter(
-                Submission.team_id == team.id,
-                Submission.task_id.in_(bonus_task_ids),
-                Submission.status == "APPROVED"
-            ).first()
-
-            if approved_bonus:
-                eligible = True
+            for bonus_task_id in bonus_task_ids:
+                approved = (
+                    db.collection("submissions")
+                    .where("team_id", "==", team_id)
+                    .where("task_id", "==", bonus_task_id)
+                    .where("status", "==", "APPROVED")
+                    .limit(1)
+                    .stream()
+                )
+                if next(approved, None):
+                    eligible = True
+                    break
 
     if not eligible:
-        return jsonify({"error": "Access Denied: You must be in the Top 10 or have an Approved Bonus Task."}), 403
+        return jsonify({
+            "error": "Access Denied: You must be in the Top 10 or have an Approved Bonus Task."
+        }), 403
 
-    # Create power request
-    new_power = TeamPower(
-        team_id=team.id,
-        week_number=team.week_number,
-        power_type=power_type,
-        power_value=0,  
-        max_usage=1,
-        used_count=0,   
-        is_active=False 
-    )
-
-    db.session.add(new_power)
-    db.session.commit()
+    db.collection("team_powers").add({
+        "team_id": team_id,
+        "week_number": team.get("week_number"),
+        "power_type": power_type,
+        "power_value": 0,
+        "max_usage": 1,
+        "used_count": 0,
+        "is_active": False,
+        "granted_by": None,
+        "created_at": firestore_sdk.SERVER_TIMESTAMP,
+    })
 
     return jsonify({"message": f"{power_type} request submitted for approval"}), 200
 
 
-# 🔹 MASTER — Approve Power Request
-@powers_bp.route("/approve/<int:power_id>", methods=["PUT"])
+# MASTER - Approve Power Request
+@powers_bp.route("/approve/<power_id>", methods=["PUT"])
 @role_required("MASTER")
 def approve_power(power_id):
+    uid = g.uid
+    db = get_db()
 
-    from app.models import WeekConfig
-
-    power = TeamPower.query.get(power_id)
-
-    if not power:
+    power_ref = db.collection("team_powers").document(power_id)
+    power_doc = power_ref.get()
+    if not power_doc.exists:
         return jsonify({"error": "Power request not found"}), 404
 
-    if power.is_active:
+    power = power_doc.to_dict()
+    if power.get("is_active"):
         return jsonify({"error": "Power already active"}), 400
 
+    week_number = power.get("week_number")
+    wc_ref = db.collection("week_configs").document(str(week_number)).get()
+    if not wc_ref.exists:
+        return jsonify({"error": "Week config not set by master"}), 400
 
-    week_config = WeekConfig.query.filter_by(
-        week_number=power.week_number
-    ).first()
+    wc = wc_ref.to_dict()
+    if power.get("power_type") == "CURSE":
+        power_value = wc.get("curse_power", 0)
+    else:
+        power_value = wc.get("shield_power", 0)
 
-    if not week_config:
-        return jsonify({
-            "error": "Week config not set by master"
-        }), 400
-
-
-    if power.power_type == "CURSE":
-        power.power_value = week_config.curse_power
-
-    elif power.power_type == "SHIELD":
-        power.power_value = week_config.shield_power
-
-
-    power.is_active = True
-    power.granted_by = int(get_jwt_identity())
-
-    db.session.commit()
-
+    power_ref.update({
+        "is_active": True,
+        "power_value": power_value,
+        "granted_by": uid,
+    })
 
     return jsonify({
-        "message": f"{power.power_type} approved",
-        "power_value": power.power_value
+        "message": f"{power.get('power_type')} approved",
+        "power_value": power_value,
     }), 200
 
 
-
+# TEAM - View own powers
 @powers_bp.route("/my", methods=["GET"])
 @role_required("TEAM")
 def get_my_powers():
+    uid = g.uid
+    db = get_db()
 
-    user_id = int(get_jwt_identity())
-
-    team = Team.query.filter_by(
-        leader_id=user_id
-    ).first()
-
-    if not team:
+    teams = db.collection("teams").where("leader_uid", "==", uid).limit(1).stream()
+    team_doc = next(teams, None)
+    if not team_doc:
         return jsonify({"error": "Team not found"}), 404
 
-    powers = TeamPower.query.filter_by(
-        team_id=team.id
-    ).all()
-
+    team_id = team_doc.id
+    docs = db.collection("team_powers").where("team_id", "==", team_id).stream()
 
     result = []
-
-    for p in powers:
-
+    for doc in docs:
+        d = doc.to_dict()
         result.append({
-            "power_id": p.id,
-            "power_type": p.power_type,
-            "power_value": p.power_value,
-            "week_number": p.week_number,
-            "is_active": p.is_active,
-            "used_count": p.used_count
+            "power_id": doc.id,
+            "power_type": d.get("power_type"),
+            "power_value": d.get("power_value"),
+            "week_number": d.get("week_number"),
+            "is_active": d.get("is_active"),
+            "used_count": d.get("used_count"),
         })
 
     return jsonify(result), 200
 
 
-
-# 🔹 TEAM — Use Curse on another team
+# TEAM - Use Curse on another team
 @powers_bp.route("/use", methods=["POST"])
 @role_required("TEAM")
 def use_power():
-
-    user_id = int(get_jwt_identity())
+    uid = g.uid
+    db = get_db()
 
     data = request.get_json()
-
     power_id = data.get("power_id")
     target_team_id = data.get("target_team_id")
 
     if not power_id or not target_team_id:
         return jsonify({"error": "power_id and target_team_id required"}), 400
 
-    from app.models import TeamPower, Team, WeekConfig
-
-    # Get user's team
-    team = Team.query.filter_by(leader_id=user_id).first()
-
-    if not team:
+    teams = db.collection("teams").where("leader_uid", "==", uid).limit(1).stream()
+    team_doc = next(teams, None)
+    if not team_doc:
         return jsonify({"error": "Team not found"}), 404
 
-    if team.is_disqualified:
+    team = team_doc.to_dict()
+    team_id = team_doc.id
+
+    if team.get("is_disqualified"):
         return jsonify({"error": "Disqualified team cannot use powers"}), 403
 
-    # Get power
-    power = TeamPower.query.get(power_id)
-
-    if not power:
+    power_ref = db.collection("team_powers").document(power_id)
+    power_doc = power_ref.get()
+    if not power_doc.exists:
         return jsonify({"error": "Power not found"}), 404
 
-    if power.team_id != team.id:
+    power = power_doc.to_dict()
+    if power.get("team_id") != team_id:
         return jsonify({"error": "Not your power"}), 403
-
-    if not power.is_active:
+    if not power.get("is_active"):
         return jsonify({"error": "Power is not active"}), 400
-
-    if power.week_number != team.week_number:
+    if power.get("week_number") != team.get("week_number"):
         return jsonify({"error": "Power belongs to different week"}), 400
-
-
-        
-    if power.used_count >= power.max_usage:
+    if power.get("used_count", 0) >= power.get("max_usage", 1):
         return jsonify({"error": "Power usage limit reached"}), 400
-
-    # Cannot curse self
-    if team.id == target_team_id:
+    if team_id == target_team_id:
         return jsonify({"error": "Cannot target own team"}), 400
 
-    target_team = Team.query.get(target_team_id)
-
-    if not target_team:
+    target_ref = db.collection("teams").document(target_team_id)
+    target_doc = target_ref.get()
+    if not target_doc.exists:
         return jsonify({"error": "Target team not found"}), 404
 
-    if target_team.is_disqualified:
+    target_team = target_doc.to_dict()
+    if target_team.get("is_disqualified"):
         return jsonify({"error": "Target team disqualified"}), 400
 
-
-    # GLOBAL curse limit check (entire event)
-    usage_count = PowerUsageLog.query.filter_by(
-        attacker_team_id=team.id,
-        target_team_id=target_team.id
-    ).count()
-
-    GLOBAL_CURSE_LIMIT = 3  # change to 2 if rule requires
-
-    if usage_count >= GLOBAL_CURSE_LIMIT:
-        return jsonify({
-        "error": "Global curse limit on this target reached"
-        }), 400
-
-
-    # Check shield
-    shield = TeamPower.query.filter_by(
-        team_id=target_team.id,
-        week_number=target_team.week_number,
-        power_type="SHIELD",
-        is_active=True
-    ).first()
-
-    if shield and shield.used_count < shield.max_usage:
-
-        shield.used_count += 1
-
-        if shield.used_count >= shield.max_usage:
-            shield.is_active = False
-
-        power.used_count += 1
-
-        if power.used_count >= power.max_usage:
-            power.is_active = False
-
-        db.session.commit()
-
-        return jsonify({
-            "message": "Curse blocked by shield",
-            "shield_used": True
-        }), 200
-
-    # Apply curse
-    curse_value = power.power_value
-
-    deduction = min(target_team.weekly_points, curse_value)
-
-    target_team.weekly_points -= deduction
-
-    target_team.total_points -= deduction
-
-    power.used_count += 1
-
-    if power.used_count >= power.max_usage:
-        power.is_active = False
-
-    # Log curse usage
-    log = PowerUsageLog(
-        power_id=power.id,
-        attacker_team_id=team.id,
-        target_team_id=target_team.id,
-        week_number=team.week_number
+    GLOBAL_CURSE_LIMIT = 3
+    usage_count = sum(
+        1 for _ in db.collection("power_usage_logs")
+        .where("attacker_team_id", "==", team_id)
+        .where("target_team_id", "==", target_team_id)
+        .stream()
     )
+    if usage_count >= GLOBAL_CURSE_LIMIT:
+        return jsonify({"error": "Global curse limit on this target reached"}), 400
 
-    db.session.add(log)
-    db.session.commit()
+    shields = (
+        db.collection("team_powers")
+        .where("team_id", "==", target_team_id)
+        .where("week_number", "==", target_team.get("week_number"))
+        .where("power_type", "==", "SHIELD")
+        .where("is_active", "==", True)
+        .limit(1)
+        .stream()
+    )
+    shield_doc = next(shields, None)
+
+    if shield_doc:
+        shield = shield_doc.to_dict()
+        if shield.get("used_count", 0) < shield.get("max_usage", 1):
+            new_shield_count = shield.get("used_count", 0) + 1
+            shield_updates = {"used_count": new_shield_count}
+            if new_shield_count >= shield.get("max_usage", 1):
+                shield_updates["is_active"] = False
+            db.collection("team_powers").document(shield_doc.id).update(shield_updates)
+
+            new_power_count = power.get("used_count", 0) + 1
+            power_updates = {"used_count": new_power_count}
+            if new_power_count >= power.get("max_usage", 1):
+                power_updates["is_active"] = False
+            power_ref.update(power_updates)
+
+            return jsonify({"message": "Curse blocked by shield", "shield_used": True}), 200
+
+    curse_value = power.get("power_value", 0)
+    current_weekly = target_team.get("weekly_points", 0)
+    current_total = target_team.get("total_points", 0)
+    deduction = min(current_weekly, curse_value)
+
+    target_ref.update({
+        "weekly_points": current_weekly - deduction,
+        "total_points": current_total - deduction,
+    })
+
+    new_used = power.get("used_count", 0) + 1
+    power_updates = {"used_count": new_used}
+    if new_used >= power.get("max_usage", 1):
+        power_updates["is_active"] = False
+    power_ref.update(power_updates)
+
+    db.collection("power_usage_logs").add({
+        "power_id": power_id,
+        "attacker_team_id": team_id,
+        "target_team_id": target_team_id,
+        "week_number": team.get("week_number"),
+        "created_at": firestore_sdk.SERVER_TIMESTAMP,
+    })
 
     return jsonify({
         "message": "Curse applied successfully",
-        "points_deducted": deduction
+        "points_deducted": deduction,
     }), 200

@@ -1,8 +1,7 @@
-from flask import Blueprint, jsonify
-from flask_jwt_extended import get_jwt_identity
+from flask import Blueprint, jsonify, g
+from firebase_admin import firestore as firestore_sdk
+from app.firebase_app import get_db
 from app.middleware.role_required import role_required
-from app.models import GameState, Team, User
-from app.extensions import db
 
 
 game_state_bp = Blueprint(
@@ -12,135 +11,132 @@ game_state_bp = Blueprint(
 )
 
 
-SUPER_ADMIN_EMAIL = "uzumakiaditya433@gmail.com"
+SUPER_ADMIN_EMAIL = "gamesburner10@gmail.com"
 
 
-def is_super_admin(user_id):
+def is_super_admin(uid):
+    db = get_db()
+    doc = db.collection("users").document(uid).get()
+    return doc.exists and doc.to_dict().get("email") == SUPER_ADMIN_EMAIL
 
-    user = User.query.get(user_id)
 
-    return user and user.email == SUPER_ADMIN_EMAIL
+def _get_or_create_state():
+    db = get_db()
+    ref = db.collection("game_state").document("current")
+    doc = ref.get()
+    if not doc.exists:
+        default = {
+            "is_active": False,
+            "is_paused": False,
+            "registration_open": True,
+            "current_week": 1,
+            "updated_by": None,
+        }
+        ref.set(default)
+        return ref, default
+    return ref, doc.to_dict()
+
 
 
 # START GAME
 @game_state_bp.route("/start", methods=["POST"])
 @role_required("MASTER")
 def start_game():
-
-    user_id = int(get_jwt_identity())
-
-    if not is_super_admin(user_id):
+    uid = g.uid
+    if not is_super_admin(uid):
         return jsonify({"error": "Only Super Admin can start game"}), 403
 
-    state = GameState.query.first()
-
-    if not state:
-        state = GameState()
-        db.session.add(state)
-
-    state.is_active = True
-    state.is_paused = False
-    state.registration_open = False
-    state.updated_by = user_id
-
-    db.session.commit()
-
-    return jsonify({
-        "message": "Game started successfully"
-    }), 200
+    ref, _ = _get_or_create_state()
+    ref.update({
+        "is_active": True,
+        "is_paused": False,
+        "registration_open": False,
+        "updated_by": uid,
+    })
+    return jsonify({"message": "Game started successfully"}), 200
 
 
 # PAUSE GAME
 @game_state_bp.route("/pause", methods=["POST"])
 @role_required("MASTER")
 def pause_game():
-
-    user_id = int(get_jwt_identity())
-
-    if not is_super_admin(user_id):
+    uid = g.uid
+    if not is_super_admin(uid):
         return jsonify({"error": "Only Super Admin can pause game"}), 403
 
-    state = GameState.query.first()
-
-    if not state or not state.is_active:
+    db = get_db()
+    ref = db.collection("game_state").document("current")
+    doc = ref.get()
+    if not doc.exists or not doc.to_dict().get("is_active"):
         return jsonify({"error": "Game not active"}), 400
 
-    state.is_paused = True
-    state.updated_by = user_id
-
-    db.session.commit()
-
-    return jsonify({
-        "message": "Game paused"
-    }), 200
+    ref.update({"is_paused": True, "updated_by": uid})
+    return jsonify({"message": "Game paused"}), 200
 
 
 # RESUME GAME
 @game_state_bp.route("/resume", methods=["POST"])
 @role_required("MASTER")
 def resume_game():
-
-    user_id = int(get_jwt_identity())
-
-    if not is_super_admin(user_id):
+    uid = g.uid
+    if not is_super_admin(uid):
         return jsonify({"error": "Only Super Admin can resume game"}), 403
 
-    state = GameState.query.first()
-
-    state.is_paused = False
-    state.updated_by = user_id
-
-    db.session.commit()
-
-    return jsonify({
-        "message": "Game resumed"
-    }), 200
+    db = get_db()
+    db.collection("game_state").document("current").update({
+        "is_paused": False,
+        "updated_by": uid,
+    })
+    return jsonify({"message": "Game resumed"}), 200
 
 
 # STOP GAME
 @game_state_bp.route("/stop", methods=["POST"])
 @role_required("MASTER")
 def stop_game():
-
-    user_id = int(get_jwt_identity())
-
-    if not is_super_admin(user_id):
+    uid = g.uid
+    if not is_super_admin(uid):
         return jsonify({"error": "Only Super Admin can stop game"}), 403
 
-    state = GameState.query.first()
+    db = get_db()
+    db.collection("game_state").document("current").update({
+        "is_active": False,
+        "registration_open": False,
+        "updated_by": uid,
+    })
 
-    state.is_active = False
-    state.registration_open = False
-    state.updated_by = user_id
+    # Find winner: highest total_points, not disqualified
+    teams_stream = (
+        db.collection("teams")
+        .where("is_disqualified", "==", False)
+        .order_by("total_points", direction=firestore_sdk.Query.DESCENDING)
+        .limit(1)
+        .stream()
+    )
+    winner_name = None
+    for t in teams_stream:
+        winner_name = t.to_dict().get("team_name")
+        break
 
-    winner = Team.query.filter_by(
-        is_disqualified=False
-    ).order_by(Team.total_points.desc()).first()
-
-    db.session.commit()
-
-    return jsonify({
-        "message": "Game stopped",
-        "winner": winner.team_name if winner else None
-    }), 200
+    return jsonify({"message": "Game stopped", "winner": winner_name}), 200
 
 
 # GAME STATUS
 @game_state_bp.route("/status", methods=["GET"])
 def game_status():
-
-    state = GameState.query.first()
-
-    if not state:
+    db = get_db()
+    doc = db.collection("game_state").document("current").get()
+    if not doc.exists:
         return jsonify({
             "is_active": False,
             "is_paused": False,
-            "registration_open": True
+            "registration_open": True,
         }), 200
 
+    state = doc.to_dict()
     return jsonify({
-        "is_active": state.is_active,
-        "is_paused": state.is_paused,
-        "registration_open": state.registration_open,
-        "current_week": state.current_week
+        "is_active": state.get("is_active", False),
+        "is_paused": state.get("is_paused", False),
+        "registration_open": state.get("registration_open", True),
+        "current_week": state.get("current_week", 1),
     }), 200

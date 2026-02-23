@@ -1,22 +1,23 @@
 import axios from 'axios';
+import { auth } from '../firebase';
 
-// Create the axios instance with your live Render backend URL
+// Create the axios instance pointing at the backend
 const api = axios.create({
   baseURL: 'https://culling-games-backend.onrender.com/api',
 });
 
-// Automatically attach JWT token to every request
+// Automatically attach the Firebase ID token before every request.
+// auth.currentUser.getIdToken() auto-refreshes the token when it's close to expiring.
 api.interceptors.request.use(
-  (config) => {
-    const token = localStorage.getItem('token');
-    if (token) {
+  async (config) => {
+    const user = auth.currentUser;
+    if (user) {
+      const token = await user.getIdToken();
       config.headers.Authorization = `Bearer ${token}`;
     }
     return config;
   },
-  (error) => {
-    return Promise.reject(error);
-  }
+  (error) => Promise.reject(error)
 );
 
 export default api;

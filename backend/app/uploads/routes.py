@@ -1,5 +1,4 @@
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import get_jwt_identity
 from app.middleware.role_required import role_required
 from app.uploads.cloudinary_config import upload_file_to_cloudinary
 

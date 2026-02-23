@@ -1,8 +1,8 @@
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import get_jwt_identity
+from firebase_admin import firestore as firestore_sdk
+from app.firebase_app import get_db
 from app.middleware.role_required import role_required
-from app.models import GameState, Team, TeamPower, Task
-from app.extensions import db
+
 
 week_bp = Blueprint("week", __name__, url_prefix="/api/admin/week")
 
@@ -10,41 +10,37 @@ week_bp = Blueprint("week", __name__, url_prefix="/api/admin/week")
 @week_bp.route("/set", methods=["PUT"])
 @role_required("MASTER")
 def set_week():
-
-    user_id = int(get_jwt_identity())
-
     data = request.get_json()
-
     new_week = data.get("week_number")
 
     if not new_week or new_week < 1:
         return jsonify({"error": "Invalid week"}), 400
 
-    state = GameState.query.first()
+    db = get_db()
+    batch = db.batch()
 
-    state.current_week = new_week
+    # Update game_state/current
+    state_ref = db.collection("game_state").document("current")
+    batch.update(state_ref, {
+        "current_week": new_week,
+        "last_reset_at": firestore_sdk.SERVER_TIMESTAMP,
+    })
 
-    from datetime import datetime
-    state.last_reset_at = datetime.utcnow()
+    # Update all teams
+    for t in db.collection("teams").stream():
+        batch.update(
+            db.collection("teams").document(t.id),
+            {"week_number": new_week, "weekly_points": 0, "weekly_cap_reached": False},
+        )
 
+    # Deactivate all active powers
+    for p in db.collection("team_powers").where("is_active", "==", True).stream():
+        batch.update(db.collection("team_powers").document(p.id), {"is_active": False})
 
-    # update all teams to new week
-    teams = Team.query.all()
+    # Deactivate all active tasks
+    for tk in db.collection("tasks").where("is_active", "==", True).stream():
+        batch.update(db.collection("tasks").document(tk.id), {"is_active": False})
 
-    for team in teams:
+    batch.commit()
 
-        team.week_number = new_week
-        team.weekly_points = 0
-        team.weekly_cap_reached = False
-
-    # deactivate all old powers
-    TeamPower.query.update({"is_active": False})
-
-    # deactivate old tasks
-    Task.query.update({"is_active": False})
-
-    db.session.commit()
-
-    return jsonify({
-        "message": f"Week changed to {new_week}"
-    }), 200
+    return jsonify({"message": f"Week changed to {new_week}"}), 200

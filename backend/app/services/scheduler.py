@@ -1,26 +1,11 @@
-from apscheduler.schedulers.background import BackgroundScheduler
-
-scheduler = None
+# Scheduling has been moved to Firebase Cloud Functions.
+# See firebase/functions/ for the weekly reset Cloud Function.
+#
+# This file is kept as a stub for backwards compatibility.
 
 def start_scheduler(app):
-
-    global scheduler
-
-    if scheduler:
-        return
-
-    from app.services.weekly_reset_service import weekly_reset
-
-    scheduler = BackgroundScheduler()
-
-    scheduler.add_job(
-        func=lambda: weekly_reset(),
-        trigger="cron",
-        day_of_week="mon",
-        hour=0,
-        minute=0
+    """No-op: APScheduler removed. Weekly resets handled by Firebase Cloud Functions."""
+    app.logger.info(
+        "Scheduler stub called — weekly reset is managed by Firebase Cloud Functions."
     )
 
-    scheduler.start()
-
-    app.logger.info("Scheduler started successfully")

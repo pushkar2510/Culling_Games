@@ -3,11 +3,12 @@ load_dotenv()
 
 from flask import Flask
 from .config import Config
-from .extensions import db, jwt, migrate, mail, limiter
-
+from .extensions import mail, limiter
+from .firebase_app import init_firebase
 from app.uploads.cloudinary_config import init_cloudinary
+from flask_cors import CORS
 
-# Blueprints imports
+# Blueprint imports
 from app.auth.routes import auth_bp
 from app.team.routes import team_bp
 from app.tasks.routes import tasks_bp
@@ -21,54 +22,20 @@ from app.admin.game_state_routes import game_state_bp
 from app.query.routes import query_bp
 from app.admin.week_routes import week_bp
 
-# Models imports
-from app.models import (
-    User,
-    ActiveSession,
-    Team,
-    TeamMember,
-    Task,
-    Submission,
-    PointAdjustment,
-    Notification,
-    TeamPower,
-    WeekConfig
-)
-
-from flask_cors import CORS
 
 def create_app():
     app = Flask(__name__)
     CORS(app)
     app.config.from_object(Config)
 
+    # Boot Firebase Admin SDK (Firestore + Auth)
+    init_firebase()
 
     init_cloudinary(app)
-
-    db.init_app(app)
-    jwt.init_app(app)
-    migrate.init_app(app, db)
     mail.init_app(app)
     limiter.init_app(app)
 
-    from flask_jwt_extended import get_jwt
-    from app.models import ActiveSession
-
-    @jwt.token_in_blocklist_loader
-    def check_if_token_revoked(jwt_header, jwt_payload):
-
-        jti = jwt_payload["jti"]
-
-        session = ActiveSession.query.filter_by(
-            jwt_id=jti
-        ).first()
-
-        if not session:
-            return True
-
-        return False
-
-
+    # Register blueprints
     app.register_blueprint(auth_bp)
     app.register_blueprint(team_bp)
     app.register_blueprint(tasks_bp)
@@ -82,17 +49,12 @@ def create_app():
     app.register_blueprint(query_bp)
     app.register_blueprint(week_bp)
 
-
     @app.route("/")
     def home():
         return {"message": "Culling Games Backend Running Successfully"}
 
     @app.route("/health")
     def health():
-        return {
-            "status": "healthy",
-            "service": "culling-games-backend"
-        }, 200
-
+        return {"status": "healthy", "service": "culling-games-backend"}, 200
 
     return app

@@ -1,12 +1,8 @@
 from app import create_app
-from app.services.scheduler import start_scheduler
 
 app = create_app()
 
-with app.app_context():
-    start_scheduler(app)
+# Weekly resets are handled by Firebase Cloud Functions.
+# This file is kept for backwards compatibility with Heroku-style clock dynos.
+# No APScheduler is started here.
 
-# Keep process alive
-import time
-while True:
-    time.sleep(60)

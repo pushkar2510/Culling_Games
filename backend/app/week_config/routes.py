@@ -1,8 +1,7 @@
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import get_jwt_identity
+from flask import Blueprint, request, jsonify, g
+from firebase_admin import firestore as firestore_sdk
+from app.firebase_app import get_db
 from app.middleware.role_required import role_required
-from app.models import WeekConfig
-from app.extensions import db
 
 
 week_config_bp = Blueprint(
@@ -16,7 +15,7 @@ week_config_bp = Blueprint(
 @week_config_bp.route("/set", methods=["POST"])
 @role_required("MASTER")
 def set_week_config():
-
+    uid = g.uid
     data = request.get_json()
 
     week_number = data.get("week_number")
@@ -29,62 +28,35 @@ def set_week_config():
             "error": "week_number, curse_power, shield_power required"
         }), 400
 
+    db = get_db()
+    doc_id = str(week_number)
+    ref = db.collection("week_configs").document(doc_id)
 
-    existing = WeekConfig.query.filter_by(
-        week_number=week_number
-    ).first()
+    ref.set({
+        "week_number": week_number,
+        "curse_power": curse_power,
+        "shield_power": shield_power,
+        "weekly_cap": weekly_cap,
+        "created_by": uid,
+        "updated_at": firestore_sdk.SERVER_TIMESTAMP,
+    }, merge=True)
 
-
-    if existing:
-
-        existing.curse_power = curse_power
-        existing.shield_power = shield_power
-        existing.weekly_cap = weekly_cap
-        existing.created_by = int(get_jwt_identity())
-
-        db.session.commit()
-
-        return jsonify({
-            "message": "Week config updated"
-        }), 200
-
-
-    new_config = WeekConfig(
-        week_number=week_number,
-        curse_power=curse_power,
-        shield_power=shield_power,
-        weekly_cap=weekly_cap,
-        created_by=int(get_jwt_identity())
-    )
-
-    db.session.add(new_config)
-    db.session.commit()
-
-
-    return jsonify({
-        "message": "Week config created"
-    }), 201
-
+    return jsonify({"message": "Week config saved"}), 200
 
 
 # 🔹 PUBLIC — View All Week Config
 @week_config_bp.route("/all", methods=["GET"])
 def get_all_week_configs():
-
-    configs = WeekConfig.query.order_by(
-        WeekConfig.week_number.asc()
-    ).all()
+    db = get_db()
+    docs = db.collection("week_configs").order_by("week_number").stream()
 
     result = []
-
-    for c in configs:
-
+    for doc in docs:
+        d = doc.to_dict()
         result.append({
-            "week_number": c.week_number,
-            "curse_power": c.curse_power,
-            "shield_power": c.shield_power,
-            "weekly_cap": c.weekly_cap
+            "week_number": d.get("week_number"),
+            "curse_power": d.get("curse_power"),
+            "shield_power": d.get("shield_power"),
+            "weekly_cap": d.get("weekly_cap"),
         })
 
-
-    return jsonify(result), 200

@@ -1,63 +1,53 @@
-from app.models import User, Team
-from app.extensions import db
+from app.firebase_app import get_db
 
 
-def assign_coordinator_to_team(team_id):
+def assign_coordinator_to_team(team_id_str):
+    """
+    Assign the coordinator with the fewest teams to the given team.
+    team_id_str: Firestore document ID string (e.g. '101').
+    """
+    db = get_db()
 
-    coordinators = User.query.filter_by(
-        role="COORDINATOR",
-        is_active=True
-    ).order_by(User.id).all()
+    coord_docs = db.collection("users")\
+        .where("role", "==", "COORDINATOR")\
+        .where("is_active", "==", True).get()
 
-    if not coordinators:
+    if not coord_docs:
         return None
 
     # Count teams per coordinator
     coordinator_load = {}
+    for coord in coord_docs:
+        uid = coord.id
+        count = len(db.collection("teams").where("coordinator_uid", "==", uid).get())
+        coordinator_load[uid] = count
 
-    for coord in coordinators:
-        count = Team.query.filter_by(
-            coordinator_id=coord.id
-        ).count()
+    selected_uid = min(coordinator_load, key=coordinator_load.get)
 
-        coordinator_load[coord.id] = count
+    db.collection("teams").document(team_id_str).update({"coordinator_uid": selected_uid})
 
-    # Find coordinator with minimum load
-    selected_coordinator_id = min(
-        coordinator_load,
-        key=coordinator_load.get
-    )
-
-    team = Team.query.get(team_id)
-
-    team.coordinator_id = selected_coordinator_id
-
-    db.session.commit()
-
-    return selected_coordinator_id
+    return selected_uid
 
 
 def rebalance_all_teams():
+    """
+    Round-robin redistribute all teams across active coordinators.
+    Called whenever a new coordinator is added.
+    """
+    db = get_db()
 
-    coordinators = User.query.filter_by(
-        role="COORDINATOR",
-        is_active=True
-    ).order_by(User.id).all()
+    coord_docs = db.collection("users")\
+        .where("role", "==", "COORDINATOR")\
+        .where("is_active", "==", True).get()
 
-    teams = Team.query.order_by(Team.id).all()
-
-    if not coordinators:
+    if not coord_docs:
         return
 
-    index = 0
-    total_coords = len(coordinators)
+    coordinators = [doc.id for doc in coord_docs]  # list of UIDs
+    teams = db.collection("teams").order_by("team_id").get()
 
-    for team in teams:
-
-        coordinator = coordinators[index % total_coords]
-
-        team.coordinator_id = coordinator.id
-
-        index += 1
-
-    db.session.commit()
+    batch = db.batch()
+    for i, team_doc in enumerate(teams):
+        coord_uid = coordinators[i % len(coordinators)]
+        batch.update(team_doc.reference, {"coordinator_uid": coord_uid})
+    batch.commit()

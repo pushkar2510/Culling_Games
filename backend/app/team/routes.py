@@ -1,261 +1,231 @@
-from app.services.coordinator_assignment_service import assign_coordinator_to_team
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import get_jwt_identity
-from app.middleware.role_required import role_required
-from app.models import Team, TeamMember, User, Notification, TeamPower, Query
-from app.extensions import db
+from app.firebase_app import get_db, next_team_id
+from app.middleware.role_required import role_required, get_current_uid
+from app.services.coordinator_assignment_service import assign_coordinator_to_team
+from datetime import datetime
 
 team_bp = Blueprint("team", __name__, url_prefix="/api/team")
 
 
+# ─── helpers ─────────────────────────────────────────────────────────────────
+
+def _get_team_by_leader(uid):
+    """Return (team_id_str, team_dict) or (None, None) if not found."""
+    db = get_db()
+    docs = db.collection("teams").where("leader_uid", "==", uid).limit(1).get()
+    if not docs:
+        return None, None
+    doc = docs[0]
+    return doc.id, doc.to_dict()
+
+
+def _get_team_rank(team_id, total_points):
+    db = get_db()
+    higher = db.collection("teams")\
+        .where("is_disqualified", "==", False)\
+        .where("total_points", ">", total_points).get()
+    return len(higher) + 1
+
+
+# ─── routes ───────────────────────────────────────────────────────────────────
+
 @team_bp.route("/create", methods=["POST"])
 @role_required("TEAM")
 def create_team():
-    user_id = int(get_jwt_identity())
+    uid = get_current_uid()
+    db = get_db()
     data = request.get_json()
 
     team_name = data.get("team_name")
     members = data.get("members")
 
-    # Validate input
     if not team_name or not members:
         return jsonify({"error": "Team name and members required"}), 400
 
-    # Must be exactly 4 members (leader + 4 = 5 total)
     if len(members) != 4:
-        return jsonify({"error": "Team must have exactly 5 members including leader (add 4 members)"}), 400
+        return jsonify({
+            "error": "Team must have exactly 5 members including leader (add 4 members)"
+        }), 400
 
     # Check if leader already has a team
-    existing_team = Team.query.filter_by(leader_id=user_id).first()
-    if existing_team:
+    existing, _ = _get_team_by_leader(uid)
+    if existing:
         return jsonify({"error": "You have already created a team"}), 400
 
-    # 🔥 REMOVED THE UNIQUE TEAM NAME CHECK HERE 🔥
+    new_id = next_team_id()
+    team_id_str = str(new_id)
 
-    # 🔥 ADDED DYNAMIC ID LOGIC 🔥
-    # Get the last created team to figure out the next ID
-    last_team = Team.query.order_by(Team.id.desc()).first()
-    next_id = last_team.id + 1 if last_team and last_team.id >= 101 else 101
+    team_data = {
+        "team_id": new_id,
+        "team_name": team_name,
+        "leader_uid": uid,
+        "coordinator_uid": None,
+        "total_points": 0,
+        "weekly_points": 0,
+        "week_number": 1,
+        "weekly_cap_reached": False,
+        "is_disqualified": False,
+        "created_at": datetime.utcnow().isoformat(),
+    }
 
-    # Create team with the new dynamic ID
-    new_team = Team(
-        id=next_id,
-        team_name=team_name,
-        leader_id=user_id
-    )
+    db.collection("teams").document(team_id_str).set(team_data)
 
-    db.session.add(new_team)
-    db.session.flush()  # Get team ID before commit
-
-    # Add team members
+    # Add members
+    batch = db.batch()
     for member in members:
         name = member.get("name")
         email = member.get("email")
-
         if not name or not email:
             return jsonify({"error": "Each member must have name and email"}), 400
+        ref = db.collection("team_members").document()
+        batch.set(ref, {
+            "team_id": new_id,
+            "member_name": name,
+            "member_email": email,
+        })
+    batch.commit()
 
-        team_member = TeamMember(
-            team_id=new_team.id,
-            member_name=name,
-            member_email=email
-        )
-
-        db.session.add(team_member)
-
-    db.session.commit()
-
-    # Assign coordinator automatically
-    assign_coordinator_to_team(new_team.id)
+    assign_coordinator_to_team(team_id_str)
 
     return jsonify({"message": "Team created successfully"}), 201
-
 
 
 @team_bp.route("/me", methods=["GET"])
 @role_required("TEAM")
 def get_my_team():
-    user_id = int(get_jwt_identity())
+    uid = get_current_uid()
+    db = get_db()
 
-    team = Team.query.filter_by(leader_id=user_id).first()
-
+    team_id_str, team = _get_team_by_leader(uid)
     if not team:
         return jsonify({"error": "No team found for this leader"}), 404
 
-    members = TeamMember.query.filter_by(team_id=team.id).all()
+    members_docs = db.collection("team_members")\
+        .where("team_id", "==", team["team_id"]).get()
 
     members_list = [
-        {
-            "name": member.member_name,
-            "email": member.member_email
-        }
-        for member in members
+        {"name": m.to_dict()["member_name"], "email": m.to_dict()["member_email"]}
+        for m in members_docs
     ]
 
     return jsonify({
-        "team_id": team.id,  # Ensure Team ID is sent to the frontend
-        "team_name": team.team_name,
-        "leader_id": team.leader_id,
-        "total_points": team.total_points,
-        "weekly_points": team.weekly_points,
-        "week_number": team.week_number,
-        "weekly_cap_reached": team.weekly_cap_reached,
-        "is_disqualified": team.is_disqualified,
-        "members": members_list
+        "team_id": team["team_id"],
+        "team_name": team["team_name"],
+        "leader_id": team["leader_uid"],
+        "total_points": team["total_points"],
+        "weekly_points": team["weekly_points"],
+        "week_number": team["week_number"],
+        "weekly_cap_reached": team["weekly_cap_reached"],
+        "is_disqualified": team["is_disqualified"],
+        "members": members_list,
     }), 200
-
 
 
 @team_bp.route("/dashboard", methods=["GET"])
 @role_required("TEAM")
 def team_dashboard():
-    user_id = int(get_jwt_identity())
-    
-    # Get the team where user is leader
-    team = Team.query.filter_by(leader_id=user_id).first()
-    
+    uid = get_current_uid()
+    db = get_db()
+
+    team_id_str, team = _get_team_by_leader(uid)
     if not team:
         return jsonify({"error": "No team found for this leader"}), 404
-    
-    # Get team members
-    members = TeamMember.query.filter_by(team_id=team.id).all()
-    
+
+    members_docs = db.collection("team_members")\
+        .where("team_id", "==", team["team_id"]).get()
+
     members_list = [
-        {
-            "id": member.id,
-            "name": member.member_name,
-            "email": member.member_email,
-            "joined_at": member.created_at.isoformat() if hasattr(member, 'created_at') else None
-        }
-        for member in members
+        {"name": m.to_dict()["member_name"], "email": m.to_dict()["member_email"]}
+        for m in members_docs
     ]
-    
-    # Get recent activity or statistics (you can customize this based on your needs)
-    dashboard_data = {
+
+    rank = _get_team_rank(team_id_str, team["total_points"])
+
+    return jsonify({
         "team_info": {
-            "team_name": team.team_name,
-            "team_id": team.id,
-            "leader_id": team.leader_id,
-            "total_points": team.total_points,
-            "weekly_points": team.weekly_points,
-            "week_number": team.week_number,
-            "weekly_cap_reached": team.weekly_cap_reached,
-            "is_disqualified": team.is_disqualified,
-            "created_at": team.created_at.isoformat() if hasattr(team, 'created_at') else None
+            "team_name": team["team_name"],
+            "team_id": team["team_id"],
+            "leader_id": team["leader_uid"],
+            "total_points": team["total_points"],
+            "weekly_points": team["weekly_points"],
+            "week_number": team["week_number"],
+            "weekly_cap_reached": team["weekly_cap_reached"],
+            "is_disqualified": team["is_disqualified"],
+            "created_at": team.get("created_at"),
         },
         "members": members_list,
         "member_count": len(members_list),
         "stats": {
             "total_members": len(members_list),
-            "completion_rate": calculate_completion_rate(team.id),  # You'll need to implement this
-            "rank": get_team_rank(team.id)  # You'll need to implement this
+            "rank": rank,
         },
-        "recent_activities": get_recent_activities(team.id)  # You'll need to implement this
-    }
-    
-    return jsonify(dashboard_data), 200
+    }), 200
 
 
 @team_bp.route("/full-dashboard", methods=["GET"])
 @role_required("TEAM")
 def full_dashboard():
+    uid = get_current_uid()
+    db = get_db()
 
-    user_id = int(get_jwt_identity())
+    team_id_str, team = _get_team_by_leader(uid)
+    if not team:
+        return jsonify({"error": "No team found"}), 404
 
-    team = Team.query.filter_by(
-        leader_id=user_id
-    ).first()
+    notif_docs = db.collection("notifications")\
+        .where("is_active", "==", True).get()
 
-    notifications = Notification.query.filter_by(
-        is_active=True
-    ).all()
+    power_docs = db.collection("team_powers")\
+        .where("team_id", "==", team["team_id"]).get()
 
-    powers = TeamPower.query.filter_by(
-        team_id=team.id
-    ).all()
-
-    queries = Query.query.filter_by(
-        team_id=team.id
-    ).all()
+    query_docs = db.collection("queries")\
+        .where("team_id", "==", team["team_id"]).get()
 
     return jsonify({
-
         "team": {
-            "team_name": team.team_name,
-            "total_points": team.total_points,
-            "weekly_points": team.weekly_points,
-            "week_number": team.week_number
+            "team_name": team["team_name"],
+            "total_points": team["total_points"],
+            "weekly_points": team["weekly_points"],
+            "week_number": team["week_number"],
         },
-
         "notifications": [
-            {
-                "title": n.title,
-                "message": n.message
-            } for n in notifications
+            {"title": n.to_dict()["title"], "message": n.to_dict()["message"]}
+            for n in notif_docs
         ],
-
         "powers": [
             {
-                "type": p.power_type,
-                "value": p.power_value,
-                "active": p.is_active
-            } for p in powers
+                "type": p.to_dict()["power_type"],
+                "value": p.to_dict()["power_value"],
+                "active": p.to_dict()["is_active"],
+            }
+            for p in power_docs
         ],
-
         "queries": [
             {
-                "question": q.question,
-                "response": q.response
-            } for q in queries
-        ]
-
+                "question": q.to_dict()["question"],
+                "response": q.to_dict().get("response"),
+            }
+            for q in query_docs
+        ],
     }), 200
 
 
-# 🔹 PUBLIC — Leaderboard
 @team_bp.route("/leaderboard", methods=["GET"])
 def leaderboard():
-    teams = Team.query.filter_by(is_disqualified=False)\
-        .order_by(Team.total_points.desc()).all()
+    db = get_db()
+    docs = db.collection("teams")\
+        .where("is_disqualified", "==", False)\
+        .order_by("total_points", direction="DESCENDING").get()
 
     result = []
-    rank = 1
-
-    for team in teams:
+    for rank, doc in enumerate(docs, 1):
+        t = doc.to_dict()
         result.append({
             "rank": rank,
-            "team_id": team.id,
-            "team_name": team.team_name,
-            "total_points": team.total_points,
-            "weekly_points": team.weekly_points
+            "team_id": t["team_id"],
+            "team_name": t["team_name"],
+            "total_points": t["total_points"],
+            "weekly_points": t["weekly_points"],
         })
-        rank += 1
 
     return jsonify(result), 200
-
-
-# Helper functions (you may need to implement these based on your models)
-def calculate_completion_rate(team_id):
-    # Implement logic to calculate task/challenge completion rate
-    # This is a placeholder
-    return 0.0
-
-
-def get_team_rank(team_id):
-    # Get team's rank in leaderboard
-    team = Team.query.get(team_id)
-    if not team:
-        return None
-    
-    higher_ranked = Team.query.filter(
-        Team.is_disqualified == False,
-        Team.total_points > team.total_points
-    ).count()
-    
-    return higher_ranked + 1
-
-
-def get_recent_activities(team_id):
-    # Implement logic to get recent team activities
-    # This is a placeholder
-    return []
